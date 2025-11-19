@@ -1,1 +1,377 @@
 
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <MPU6050.h>
+
+// OLED Display settings
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// MPU6050
+MPU6050 mpu;
+
+// Gyroscope calibration offsets
+int16_t gxOffset = 0, gyOffset = 0, gzOffset = 0;
+
+// 3D projection variables
+float angleX = 0, angleY = 0, angleZ = 0;
+const float scale = 20;
+const int centerX = SCREEN_WIDTH / 2;
+const int centerY = SCREEN_HEIGHT / 2;
+
+// Object selection
+int currentObject = 0;
+const int NUM_OBJECTS = 5;
+String objectNames[] = {"Cube", "Diamond", "Pyramid", "Flower", "Human"};
+
+// Shake detection
+const float SHAKE_THRESHOLD = 15000; // Lower threshold for better detection
+unsigned long lastShakeTime = 0;
+const unsigned long SHAKE_COOLDOWN = 10000; // 10 seconds cooldown
+int16_t lastAx = 0, lastAy = 0, lastAz = 0;
+bool shakeDetected = false;
+
+// 3D Point structure
+struct Point3D {
+  float x, y, z;
+};
+
+// Cube vertices
+Point3D cubeVertices[8] = {
+  {-1, -1, -1}, {1, -1, -1}, {1, 1, -1}, {-1, 1, -1},
+  {-1, -1, 1}, {1, -1, 1}, {1, 1, 1}, {-1, 1, 1}
+};
+
+// Diamond vertices
+Point3D diamondVertices[6] = {
+  {0, 1.5, 0}, {-1, 0, -1}, {1, 0, -1}, 
+  {1, 0, 1}, {-1, 0, 1}, {0, -1.5, 0}
+};
+
+// Pyramid vertices
+Point3D pyramidVertices[5] = {
+  {0, 1.5, 0},      // Top point
+  {-1, -1, -1},     // Base corners
+  {1, -1, -1},
+  {1, -1, 1},
+  {-1, -1, 1}
+};
+
+// Flower vertices (center + 6 petals)
+Point3D flowerVertices[13] = {
+  {0, 0, 0},        // Center
+  {0.8, 0, 0}, {0.4, 0.7, 0}, {-0.4, 0.7, 0},    // Petals
+  {-0.8, 0, 0}, {-0.4, -0.7, 0}, {0.4, -0.7, 0},
+  {0, 0, 0.8}, {0, 0.7, 0.4}, {0, 0.7, -0.4},    // 3D petals
+  {0, 0, -0.8}, {0, -0.7, -0.4}, {0, -0.7, 0.4}
+};
+
+// Simple stick figure human
+Point3D humanVertices[10] = {
+  {0, 1.2, 0},      // Head
+  {0, 0.5, 0},      // Neck
+  {0, -0.3, 0},     // Torso bottom
+  {-0.5, 0.3, 0}, {0.5, 0.3, 0},    // Shoulders
+  {-0.7, -0.5, 0}, {0.7, -0.5, 0},  // Hands
+  {-0.3, -1.2, 0}, {0.3, -1.2, 0},  // Feet
+  {0, -0.3, 0}      // Hip center
+};
+
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+  
+  // Initialize OLED
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for(;;);
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.display();
+  
+  // Initialize MPU6050
+  mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println("MPU6050 connection failed");
+    while(1);
+  }
+  
+  // Calibrate gyroscope (keep MPU6050 still during startup)
+  Serial.println("Calibrating... Keep MPU6050 still!");
+  display.clearDisplay();
+  display.setCursor(0, 20);
+  display.println("Calibrating...");
+  display.println("Keep still!");
+  display.display();
+  
+  long gxSum = 0, gySum = 0, gzSum = 0;
+  int samples = 100;
+  
+  for (int i = 0; i < samples; i++) {
+    int16_t ax, ay, az, gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    gxSum += gx;
+    gySum += gy;
+    gzSum += gz;
+    delay(10);
+  }
+  
+  gxOffset = gxSum / samples;
+  gyOffset = gySum / samples;
+  gzOffset = gzSum / samples;
+  
+  Serial.println("Calibration complete!");
+  Serial.print("Offsets: ");
+  Serial.print(gxOffset); Serial.print(", ");
+  Serial.print(gyOffset); Serial.print(", ");
+  Serial.println(gzOffset);
+  
+  delay(500);
+  Serial.println("System Ready!");
+}
+
+void loop() {
+  // Read MPU6050 data
+  int16_t ax, ay, az, gx, gy, gz;
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  
+  // Apply calibration offsets
+  gx -= gxOffset;
+  gy -= gyOffset;
+  gz -= gzOffset;
+  
+  // Dead zone to prevent drift (ignore small movements)
+  const int GYRO_DEADZONE = 300;
+  if (abs(gx) < GYRO_DEADZONE) gx = 0;
+  if (abs(gy) < GYRO_DEADZONE) gy = 0;
+  if (abs(gz) < GYRO_DEADZONE) gz = 0;
+  
+  // Smooth rotation using gyroscope (scaled down for smoother movement)
+  angleX += gy * 0.005; // Reduced sensitivity
+  angleY += gx * 0.005;
+  angleZ += gz * 0.005;
+  
+  // Keep angles in range
+  if (angleX > 180) angleX -= 360;
+  if (angleX < -180) angleX += 360;
+  if (angleY > 180) angleY -= 360;
+  if (angleY < -180) angleY += 360;
+  if (angleZ > 180) angleZ -= 360;
+  if (angleZ < -180) angleZ += 360;
+  
+  // Detect shake - using acceleration change (jerk)
+  int16_t deltaAx = abs(ax - lastAx);
+  int16_t deltaAy = abs(ay - lastAy);
+  int16_t deltaAz = abs(az - lastAz);
+  
+  long accelChange = (long)deltaAx*deltaAx + (long)deltaAy*deltaAy + (long)deltaAz*deltaAz;
+  
+  // Check for shake
+  if (accelChange > SHAKE_THRESHOLD) {
+    shakeDetected = true;
+  }
+  
+  // Change object if shake detected and cooldown passed
+  if (shakeDetected && millis() - lastShakeTime > SHAKE_COOLDOWN) {
+    currentObject = (currentObject + 1) % NUM_OBJECTS;
+    lastShakeTime = millis();
+    shakeDetected = false;
+    Serial.print("Shake detected! Change: ");
+    Serial.print(accelChange);
+    Serial.print(" - Object: ");
+    Serial.println(objectNames[currentObject]);
+  }
+  
+  // Store current accelerometer values
+  lastAx = ax;
+  lastAy = ay;
+  lastAz = az;
+  
+  // Clear display
+  display.clearDisplay();
+  
+  // Draw current object
+  switch(currentObject) {
+    case 0: drawCube(); break;
+    case 1: drawDiamond(); break;
+    case 2: drawPyramid(); break;
+    case 3: drawFlower(); break;
+    case 4: drawHuman(); break;
+  }
+  
+  // Display object name
+  display.setCursor(0, 0);
+  display.print(objectNames[currentObject]);
+  
+  display.display();
+  delay(10); // Reduced delay for smoother animation
+}
+
+// 3D to 2D projection
+Point3D project(Point3D p) {
+  // Rotate around X axis
+  float cosX = cos(angleX * PI / 180);
+  float sinX = sin(angleX * PI / 180);
+  float y1 = p.y * cosX - p.z * sinX;
+  float z1 = p.y * sinX + p.z * cosX;
+  
+  // Rotate around Y axis
+  float cosY = cos(angleY * PI / 180);
+  float sinY = sin(angleY * PI / 180);
+  float x2 = p.x * cosY + z1 * sinY;
+  float z2 = -p.x * sinY + z1 * cosY;
+  
+  // Rotate around Z axis
+  float cosZ = cos(angleZ * PI / 180);
+  float sinZ = sin(angleZ * PI / 180);
+  float x3 = x2 * cosZ - y1 * sinZ;
+  float y3 = x2 * sinZ + y1 * cosZ;
+  
+  // Perspective projection
+  float perspective = 1.0 / (1.0 + z2 * 0.1);
+  Point3D projected;
+  projected.x = centerX + x3 * scale * perspective;
+  projected.y = centerY + y3 * scale * perspective;
+  projected.z = z2;
+  
+  return projected;
+}
+
+void drawCube() {
+  Point3D projected[8];
+  
+  // Project all vertices
+  for (int i = 0; i < 8; i++) {
+    projected[i] = project(cubeVertices[i]);
+  }
+  
+  // Draw edges
+  int edges[12][2] = {
+    {0,1}, {1,2}, {2,3}, {3,0}, // Front face
+    {4,5}, {5,6}, {6,7}, {7,4}, // Back face
+    {0,4}, {1,5}, {2,6}, {3,7}  // Connecting edges
+  };
+  
+  for (int i = 0; i < 12; i++) {
+    int v1 = edges[i][0];
+    int v2 = edges[i][1];
+    display.drawLine(projected[v1].x, projected[v1].y, 
+                     projected[v2].x, projected[v2].y, SSD1306_WHITE);
+  }
+}
+
+void drawDiamond() {
+  Point3D projected[6];
+  
+  // Project all vertices
+  for (int i = 0; i < 6; i++) {
+    projected[i] = project(diamondVertices[i]);
+  }
+  
+  // Draw edges
+  int edges[12][2] = {
+    {0,1}, {0,2}, {0,3}, {0,4}, // Top pyramid
+    {5,1}, {5,2}, {5,3}, {5,4}, // Bottom pyramid
+    {1,2}, {2,3}, {3,4}, {4,1}  // Middle square
+  };
+  
+  for (int i = 0; i < 12; i++) {
+    int v1 = edges[i][0];
+    int v2 = edges[i][1];
+    display.drawLine(projected[v1].x, projected[v1].y, 
+                     projected[v2].x, projected[v2].y, SSD1306_WHITE);
+  }
+}
+
+void drawPyramid() {
+  Point3D projected[5];
+  
+  // Project all vertices
+  for (int i = 0; i < 5; i++) {
+    projected[i] = project(pyramidVertices[i]);
+  }
+  
+  // Draw edges
+  int edges[8][2] = {
+    {0,1}, {0,2}, {0,3}, {0,4}, // Top to base corners
+    {1,2}, {2,3}, {3,4}, {4,1}  // Base square
+  };
+  
+  for (int i = 0; i < 8; i++) {
+    int v1 = edges[i][0];
+    int v2 = edges[i][1];
+    display.drawLine(projected[v1].x, projected[v1].y, 
+                     projected[v2].x, projected[v2].y, SSD1306_WHITE);
+  }
+}
+
+void drawFlower() {
+  Point3D projected[13];
+  
+  // Project all vertices
+  for (int i = 0; i < 13; i++) {
+    projected[i] = project(flowerVertices[i]);
+  }
+  
+  // Draw flower petals - connecting center to petal tips
+  for (int i = 1; i < 13; i++) {
+    display.drawLine(projected[0].x, projected[0].y, 
+                     projected[i].x, projected[i].y, SSD1306_WHITE);
+  }
+  
+  // Draw petal connections to form flower shape
+  int petalEdges[12][2] = {
+    {1,2}, {2,3}, {3,4}, {4,5}, {5,6}, {6,1},  // Front petals
+    {7,8}, {8,9}, {9,10}, {10,11}, {11,12}, {12,7}  // Back petals
+  };
+  
+  for (int i = 0; i < 12; i++) {
+    int v1 = petalEdges[i][0];
+    int v2 = petalEdges[i][1];
+    display.drawLine(projected[v1].x, projected[v1].y, 
+                     projected[v2].x, projected[v2].y, SSD1306_WHITE);
+  }
+  
+  // Draw center point
+  display.drawCircle(projected[0].x, projected[0].y, 2, SSD1306_WHITE);
+}
+
+void drawHuman() {
+  Point3D projected[10];
+  
+  // Project all vertices
+  for (int i = 0; i < 10; i++) {
+    projected[i] = project(humanVertices[i]);
+  }
+  
+  // Draw head
+  display.drawCircle(projected[0].x, projected[0].y, 4, SSD1306_WHITE);
+  
+  // Draw body structure
+  int bodyEdges[9][2] = {
+    {0,1},        // Head to neck
+    {1,2},        // Neck to torso
+    {1,3}, {1,4}, // Shoulders
+    {3,5}, {4,6}, // Arms
+    {2,7}, {2,8}, // Legs
+    {3,4}         // Shoulder line
+  };
+  
+  for (int i = 0; i < 9; i++) {
+    int v1 = bodyEdges[i][0];
+    int v2 = bodyEdges[i][1];
+    display.drawLine(projected[v1].x, projected[v1].y, 
+                     projected[v2].x, projected[v2].y, SSD1306_WHITE);
+  }
+  
+  // Draw hands and feet as small circles
+  display.fillCircle(projected[5].x, projected[5].y, 2, SSD1306_WHITE);
+  display.fillCircle(projected[6].x, projected[6].y, 2, SSD1306_WHITE);
+  display.fillCircle(projected[7].x, projected[7].y, 2, SSD1306_WHITE);
+  display.fillCircle(projected[8].x, projected[8].y, 2, SSD1306_WHITE);
+}
