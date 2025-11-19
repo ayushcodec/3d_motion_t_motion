@@ -1,0 +1,13 @@
+mkr 1010-----mpu6050
+5v   vcc 
+gnd  gnd
+scl  scl
+sda  sda
+
+
+
+mkr ---- oled
+5v   vcc 
+gnd  gnd
+scl  scl
+sda  sda
